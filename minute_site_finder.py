@@ -58,11 +58,12 @@ def run(path_input: str, path_output: str, path_log: str):
         parent_map = {}
         minutes_urls = data["minutes_urls"]
         for minutes_url in minutes_urls:
-            grand_parent = minutes_url["grand-parent"]
+            grand_parent = minutes_url["grand-parent"] if "grand-parent" in minutes_url else None
             parent = minutes_url["parent"]
-            if not grand_parent in grand_parent_map:
-                grand_parent_map[grand_parent] = 0
-            grand_parent_map[grand_parent] += 1
+            if grand_parent is not None:
+                if not grand_parent in grand_parent_map:
+                    grand_parent_map[grand_parent] = 0
+                grand_parent_map[grand_parent] += 1
             if not parent in parent_map:
                 parent_map[parent] = 0
             parent_map[parent] += 1
