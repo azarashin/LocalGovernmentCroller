@@ -24,7 +24,7 @@ https://github.com/kebhr/localgovlistjp
 
 ### 2.1. 議事録のURL一覧候補を取得する
 
-localgovlistjp ディレクトリはいかにlocalgov_utf8_lf.csv が格納されていることが前提です。
+localgovlistjp ディレクトリ配下にlocalgov_utf8_lf.csv が格納されていることが前提です。
 
 ```bash
 $ python minute_list_loader.py --help
