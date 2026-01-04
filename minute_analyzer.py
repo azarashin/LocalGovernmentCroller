@@ -29,9 +29,9 @@ class MinuteReportItem:
     def __str__(self) -> str:
         return (
             f"\n"
-            f"トピック: {self.topic}\n"
-            f"  関連度合い: {self.topic_relevance_score}\n"
-            f"  議事要約: {self.topic_related_summary}\n"
+            f"  トピック: {self.topic}\n"
+            f"    関連度合い: {self.topic_relevance_score}\n"
+            f"    議事要約: {self.topic_related_summary}\n"
         )
 
 
