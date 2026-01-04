@@ -2,22 +2,16 @@
 # -*- coding: utf-8 -*-
 
 """
-minutes_finder.py
+minute_filter.py (Hybrid + text export)
+- PDFのみ ProcessPoolExecutor で並列処理
+- それ以外はメインプロセスで順次処理
+- 議事録判定( score >= threshold )のものは抽出テキストを個別 .txt として出力
 
-root
-|- 都道府県名
-    |- 市町村名
-        |- 議事録かもしれないファイル
-
-上記ディレクトリを走査して「議事録と思われる」ファイルを抽出し、JSON/CSVで出力します。
-
-対応（任意）:
-- .txt / .md / .csv / .json / .log など: そのままテキストとして判定
-- .pdf: pypdf が入っていればテキスト抽出して判定
-- .docx: python-docx が入っていればテキスト抽出して判定
-- .html/.htm: BeautifulSoup が入っていればテキスト抽出して判定（無ければ簡易抽出）
-
-依存を入れない場合でも、テキスト系ファイルだけは動きます。
+出力例（text-out-dir 指定時）:
+text_out/
+  東京都/
+    渋谷区/
+      元ファイル名.txt   (元が pdf/docx/txt/html などでも .txt に)
 """
 
 from __future__ import annotations
@@ -27,10 +21,12 @@ import csv
 import json
 import os
 import re
+import time
+import multiprocessing
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass, asdict
 from pathlib import Path
-import time
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Set
 
 
 # --------------------------
@@ -129,7 +125,6 @@ NEGATIVE_KEYWORDS: Dict[str, int] = {
     "請求": -12,
 }
 
-# ファイル名に含まれると強い手掛かりになるパターン
 FILENAME_PATTERNS: List[Tuple[re.Pattern, int, str]] = [
     (re.compile(r"(議事録|会議録|議事要旨|会議要旨)"), 18, "jp_minutes_word"),
     (re.compile(r"(minutes|minute|gijiroku|kaigiroku)", re.IGNORECASE), 12, "en_minutes_word"),
@@ -138,7 +133,6 @@ FILENAME_PATTERNS: List[Tuple[re.Pattern, int, str]] = [
     (re.compile(r"(第\d+回)"), 5, "meeting_count"),
 ]
 
-# 本文側の「見出しっぽい」行（議事録にありがち）
 HEADING_HINTS: List[Tuple[re.Pattern, int, str]] = [
     (re.compile(r"^\s*(1[.)]|２[.)]|2[.)]|Ⅰ|Ⅱ|III|第\d+)\s*"), 2, "outline_like"),
     (re.compile(r"^\s*(議題|報告事項|審議事項|協議事項|議事)\s*[:：]?\s*$"), 6, "section_heading"),
@@ -147,33 +141,24 @@ HEADING_HINTS: List[Tuple[re.Pattern, int, str]] = [
 
 
 def _normalize_text(text: str) -> str:
-    # 連続空白を軽く整理
     text = text.replace("\u3000", " ")
     text = re.sub(r"[ \t]+", " ", text)
     return text
 
 
 def score_minutes(text: str, filename: str) -> Tuple[int, List[str], List[str], str]:
-    """
-    戻り値:
-      score, matched_keywords, filename_hits, snippet
-    """
     matched: List[str] = []
     filename_hit: List[str] = []
-
     score = 0
-    text_n = _normalize_text(text)
-    # 長すぎると重いので先頭中心に評価（ただしキーワードは全文も軽く見る）
-    head = text_n[:20000]
+
+    head = _normalize_text(text)[:20000]
     lines = head.splitlines()
 
-    # ファイル名パターン
     for pat, w, tag in FILENAME_PATTERNS:
         if pat.search(filename):
             score += w
             filename_hit.append(tag)
 
-    # キーワード（本文）
     for kw, w in MINUTES_KEYWORDS.items():
         if kw in head:
             score += w
@@ -184,7 +169,6 @@ def score_minutes(text: str, filename: str) -> Tuple[int, List[str], List[str], 
             score += w
             matched.append(f"NEG:{kw}")
 
-    # 見出しっぽい行のヒント
     for line in lines[:300]:
         for pat, w, tag in HEADING_HINTS:
             if pat.search(line):
@@ -192,9 +176,7 @@ def score_minutes(text: str, filename: str) -> Tuple[int, List[str], List[str], 
                 if tag not in matched:
                     matched.append(tag)
 
-    # スニペット（それっぽい行を優先）
-    snippet = ""
-    prefer_lines = []
+    prefer_lines: List[str] = []
     for line in lines:
         if any(k in line for k in ("議事録", "会議録", "議事要旨", "会議要旨", "開催日時", "出席者", "議題", "議事")):
             s = line.strip()
@@ -202,16 +184,36 @@ def score_minutes(text: str, filename: str) -> Tuple[int, List[str], List[str], 
                 prefer_lines.append(s)
         if len(prefer_lines) >= 5:
             break
+
     if prefer_lines:
         snippet = " / ".join(prefer_lines)[:300]
     else:
         snippet = re.sub(r"\s+", " ", head.strip())[:300]
 
-    # それっぽい最低限の長さ補正（短すぎるメモを弾く）
     if len(head) < 400:
         score -= 6
 
     return score, matched, filename_hit, snippet
+
+
+# --------------------------
+# 抽出テキストの個別出力
+# --------------------------
+def write_extracted_text(
+    text_out_dir: Path,
+    rel_path: str,
+    text: str,
+    encoding: str = "utf-8",
+) -> str:
+    """
+    rel_path（例: 東京都/渋谷区/foo.pdf）を保ったまま
+    text_out_dir/東京都/渋谷区/foo.txt に出力して、出力先パス文字列を返す
+    """
+    rel_txt = Path(rel_path).with_suffix(".txt")
+    out_path = (text_out_dir / rel_txt).resolve()
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(text, encoding=encoding, errors="replace")
+    return str(out_path)
 
 
 # --------------------------
@@ -225,9 +227,7 @@ DOCX_EXTS = {".docx"}
 
 
 def read_text_file(path: Path, max_bytes: int) -> str:
-    # バイナリ混入を避けつつ読む
     data = path.read_bytes()[:max_bytes]
-    # まず utf-8 を試し、ダメなら cp932/shift_jis 系を試す
     for enc in ("utf-8", "utf-8-sig", "cp932", "shift_jis", "euc_jp"):
         try:
             return data.decode(enc, errors="replace")
@@ -245,8 +245,7 @@ def read_pdf(path: Path, max_pages: int) -> str:
         texts: List[str] = []
         n = min(len(reader.pages), max_pages)
         for i in range(n):
-            page = reader.pages[i]
-            t = page.extract_text() or ""
+            t = reader.pages[i].extract_text() or ""
             if t:
                 texts.append(t)
         return "\n".join(texts)
@@ -275,7 +274,7 @@ def read_html(path: Path, max_bytes: int) -> str:
             return soup.get_text("\n")
         except Exception:
             pass
-    # 依存なし簡易版（タグ除去）
+
     text = re.sub(r"(?is)<(script|style).*?>.*?</\1>", " ", raw)
     text = re.sub(r"(?is)<br\s*/?>", "\n", text)
     text = re.sub(r"(?is)</p\s*>", "\n", text)
@@ -301,9 +300,6 @@ def extract_text(path: Path, max_bytes: int, max_pdf_pages: int) -> str:
 # 走査
 # --------------------------
 def iter_candidate_files(root: Path) -> List[Tuple[str, str, Path]]:
-    """
-    root/都道府県/市町村/ファイル を収集
-    """
     items: List[Tuple[str, str, Path]] = []
     if not root.exists():
         return items
@@ -312,13 +308,145 @@ def iter_candidate_files(root: Path) -> List[Tuple[str, str, Path]]:
         pref = pref_dir.name
         for muni_dir in sorted([m for m in pref_dir.iterdir() if m.is_dir()]):
             muni = muni_dir.name
-            for f in sorted([x for x in muni_dir.rglob("*") if x.is_file()]):  # 市町村配下は更にサブフォルダがあってもOK
+            for f in sorted([x for x in muni_dir.rglob("*") if x.is_file()]):
                 items.append((pref, muni, f))
     return items
 
 
+# --------------------------
+# 共通フィルタ
+# --------------------------
+def passes_filters(
+    path: Path,
+    min_size: int,
+    allow_exts: Set[str],
+    deny_exts: Set[str],
+) -> Optional[os.stat_result]:
+    try:
+        st = path.stat()
+    except Exception:
+        return None
+
+    if st.st_size < min_size:
+        return None
+
+    ext = path.suffix.lower()
+    if allow_exts and ext not in allow_exts:
+        return None
+    if deny_exts and ext in deny_exts:
+        return None
+
+    return st
+
+
+# --------------------------
+# メインプロセスで1ファイル処理（非PDF）
+# --------------------------
+def process_one_file_in_main(
+    pref: str,
+    muni: str,
+    path: Path,
+    root: Path,
+    threshold: int,
+    include_low: bool,
+    max_bytes: int,
+    max_pdf_pages: int,
+    min_size: int,
+    allow_exts: Set[str],
+    deny_exts: Set[str],
+    text_out_dir: Optional[Path],
+    text_out_encoding: str,
+) -> Optional[Candidate]:
+    st = passes_filters(path, min_size=min_size, allow_exts=allow_exts, deny_exts=deny_exts)
+    if st is None:
+        return None
+
+    ext = path.suffix.lower()
+    text = extract_text(path, max_bytes=max_bytes, max_pdf_pages=max_pdf_pages) or ""
+    score, matched, filename_hit, snippet = score_minutes(text, filename=path.name)
+
+    # listへ入れるか
+    if (not include_low) and (score < threshold):
+        return None
+
+    rel = str(path.relative_to(root))
+
+    # テキスト出力は「議事録判定（>=threshold）」のみ
+    if text_out_dir is not None and score >= threshold:
+        write_extracted_text(text_out_dir, rel_path=rel, text=text, encoding=text_out_encoding)
+
+    return Candidate(
+        prefecture=pref,
+        municipality=muni,
+        rel_path=rel,
+        ext=ext,
+        size_bytes=st.st_size,
+        score=score,
+        matched=matched,
+        filename_hit=filename_hit,
+        snippet=snippet,
+    )
+
+
+# --------------------------
+# PDF専用（プロセスで実行）
+#  - テキスト出力もワーカー側で行う（巨大テキストを親へ返さない）
+# --------------------------
+def process_one_pdf_in_worker(
+    pref: str,
+    muni: str,
+    path_str: str,
+    root_str: str,
+    threshold: int,
+    include_low: bool,
+    max_pdf_pages: int,
+    min_size: int,
+    allow_exts: Set[str],
+    deny_exts: Set[str],
+    text_out_dir_str: str,
+    text_out_encoding: str,
+) -> Optional[Candidate]:
+    path = Path(path_str)
+    root = Path(root_str)
+
+    st = passes_filters(path, min_size=min_size, allow_exts=allow_exts, deny_exts=deny_exts)
+    if st is None:
+        return None
+
+    ext = path.suffix.lower()
+    # PDFテキスト抽出
+    text = read_pdf(path, max_pages=max_pdf_pages) or ""
+    score, matched, filename_hit, snippet = score_minutes(text, filename=path.name)
+
+    # include_low の挙動はリスト用
+    if (not include_low) and (score < threshold):
+        return None
+
+    try:
+        rel = str(path.relative_to(root))
+    except Exception:
+        rel = os.path.relpath(path_str, root_str)
+
+    # テキスト出力は「議事録判定（>=threshold）」のみ
+    if text_out_dir_str and score >= threshold:
+        text_out_dir = Path(text_out_dir_str)
+        write_extracted_text(text_out_dir, rel_path=rel, text=text, encoding=text_out_encoding)
+
+    return Candidate(
+        prefecture=pref,
+        municipality=muni,
+        rel_path=rel,
+        ext=ext,
+        size_bytes=st.st_size,
+        score=score,
+        matched=matched,
+        filename_hit=filename_hit,
+        snippet=snippet,
+    )
+
+
 def main():
-    ap = argparse.ArgumentParser(description="議事録っぽいファイルを抽出してリスト化する")
+    ap = argparse.ArgumentParser(description="議事録っぽいファイル抽出（Hybrid: PDFのみProcessPool）+ 個別テキスト出力")
     ap.add_argument("--root", default="./data/minutes_out", help="root ディレクトリ（都道府県フォルダが並ぶ場所）")
     ap.add_argument("--out", default="./data/minutes_candidates.json", help="出力ファイル（.json または .csv）")
     ap.add_argument("--threshold", type=int, default=30, help="議事録とみなすスコア閾値（デフォルト: 30）")
@@ -328,6 +456,12 @@ def main():
     ap.add_argument("--ext-allow", default="", help="許可する拡張子のカンマ区切り（例: .pdf,.txt,.docx）。空なら全て対象")
     ap.add_argument("--ext-deny", default="", help="除外する拡張子のカンマ区切り（例: .jpg,.png）。空なら除外なし")
     ap.add_argument("--include-low", action="store_true", help="閾値未満も含めて全件出す（score付き）")
+    ap.add_argument("--workers", type=int, default=(os.cpu_count() or 4), help="PDF用ProcessPoolの並列数（デフォルト: CPUコア数）")
+
+    # ★追加：議事録判定されたファイルの抽出テキストを個別出力
+    ap.add_argument("--text-out-dir", default="", help="議事録判定されたファイルの抽出テキスト出力先ディレクトリ（空なら出力しない）")
+    ap.add_argument("--text-out-encoding", default="utf-8", help="個別テキスト出力のエンコーディング（デフォルト: utf-8）")
+
     args = ap.parse_args()
 
     root = Path(args.root).resolve()
@@ -336,53 +470,82 @@ def main():
     allow = {e.strip().lower() for e in args.ext_allow.split(",") if e.strip()}
     deny = {e.strip().lower() for e in args.ext_deny.split(",") if e.strip()}
 
-    candidates: List[Candidate] = []
+    text_out_dir: Optional[Path] = None
+    if args.text_out_dir.strip():
+        text_out_dir = Path(args.text_out_dir).resolve()
+        text_out_dir.mkdir(parents=True, exist_ok=True)
+
     files = iter_candidate_files(root)
-    
-    max = len(files)
-    count = 0
-    start = time.perf_counter()
+    total = len(files)
 
+    pdf_jobs: List[Tuple[str, str, Path]] = []
+    main_jobs: List[Tuple[str, str, Path]] = []
     for pref, muni, path in files:
-        count += 1
-        print(f'{count} / {max}', end='\r')
-        try:
-            st = path.stat()
-        except Exception:
-            continue
+        if path.suffix.lower() == ".pdf":
+            pdf_jobs.append((pref, muni, path))
+        else:
+            main_jobs.append((pref, muni, path))
 
-        if st.st_size < args.min_size:
-            continue
+    start = time.perf_counter()
+    candidates: List[Candidate] = []
+    done = 0
 
-        ext = path.suffix.lower()
-        if allow and ext not in allow:
-            continue
-        if deny and ext in deny:
-            continue
-
-        text = extract_text(path, max_bytes=args.max_bytes, max_pdf_pages=args.max_pdf_pages)
-        # テキスト抽出できない拡張子は、ファイル名のみで軽く判定
-        if not text:
-            text = ""
-
-        score, matched, filename_hit, snippet = score_minutes(text, filename=path.name)
-
-        rel = str(path.relative_to(root))
-        c = Candidate(
-            prefecture=pref,
-            municipality=muni,
-            rel_path=rel,
-            ext=ext,
-            size_bytes=st.st_size,
-            score=score,
-            matched=matched,
-            filename_hit=filename_hit,
-            snippet=snippet,
+    # 1) 非PDFはメインで順次
+    for pref, muni, path in main_jobs:
+        done += 1
+        print(f"{done} / {total}", end="\r")
+        res = process_one_file_in_main(
+            pref=pref,
+            muni=muni,
+            path=path,
+            root=root,
+            threshold=args.threshold,
+            include_low=args.include_low,
+            max_bytes=args.max_bytes,
+            max_pdf_pages=args.max_pdf_pages,
+            min_size=args.min_size,
+            allow_exts=allow,
+            deny_exts=deny,
+            text_out_dir=text_out_dir,
+            text_out_encoding=args.text_out_encoding,
         )
-        if args.include_low or score >= args.threshold:
-            candidates.append(c)
+        if res is not None:
+            candidates.append(res)
+
+    # 2) PDFだけProcessPoolで並列
+    if pdf_jobs:
+        with ProcessPoolExecutor(max_workers=args.workers) as ex:
+            futures = [
+                ex.submit(
+                    process_one_pdf_in_worker,
+                    pref,
+                    muni,
+                    str(path),
+                    str(root),
+                    args.threshold,
+                    args.include_low,
+                    args.max_pdf_pages,
+                    args.min_size,
+                    allow,
+                    deny,
+                    str(text_out_dir) if text_out_dir is not None else "",
+                    args.text_out_encoding,
+                )
+                for pref, muni, path in pdf_jobs
+            ]
+
+            for fut in as_completed(futures):
+                done += 1
+                print(f"{done} / {total}", end="\r")
+                try:
+                    res = fut.result()
+                except Exception:
+                    res = None
+                if res is not None:
+                    candidates.append(res)
 
     print()
+
     # スコア降順
     candidates.sort(key=lambda x: x.score, reverse=True)
 
@@ -409,17 +572,20 @@ def main():
         }
         out.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
-    # ざっくり統計を標準出力
     print(f"[OK] root={root}")
     print(f"[OK] out={out}")
-    print(f"[OK] extracted={len(candidates)} files")
+    print(f"[OK] extracted(listed)={len(candidates)} files")
+    print(f"[OK] text_out_dir={text_out_dir if text_out_dir is not None else '(disabled)'}")
     if candidates:
         print("[TOP 10]")
         for c in candidates[:10]:
             print(f"  score={c.score:3d}  {c.rel_path}")
+
     end = time.perf_counter()
-    print(f'lap: {end - start}sec')
+    print(f"lap: {end - start}sec")
+    print(f"pdf_jobs={len(pdf_jobs)}, main_jobs={len(main_jobs)}, workers={args.workers}")
 
 
 if __name__ == "__main__":
+    multiprocessing.freeze_support()
     main()
